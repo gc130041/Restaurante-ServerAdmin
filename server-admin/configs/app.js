@@ -21,6 +21,7 @@ import orderRoutes from '../src/orders/order.routes.js';
 import branchRoutes from '../src/branchs/branch.routes.js'; 
 import companyRoutes from '../src/companies/company.routes.js'; 
 import ingredientRoutes from '../src/ingredients/ingredient.routes.js'; 
+import usersRoutes from '../src/users/user.routes.js';
 import stockRoutes from '../src/stocks/stock.routes.js'; 
 import invoiceRoutes from '../src/invoices/invoice.routes.js';
 
@@ -44,6 +45,7 @@ const middlewares = (app) => {
 //Integracion de todas las rutas
 const routes = (app) => {
     app.use(`${BASE_URL}/companies`, companyRoutes);
+    app.use(`${BASE_URL}/users`, usersRoutes);
     app.use(`${BASE_URL}/ingredients`, ingredientRoutes);
     app.use(`${BASE_URL}/stocks`, stockRoutes);
     app.use(`${BASE_URL}/branches`, branchRoutes);

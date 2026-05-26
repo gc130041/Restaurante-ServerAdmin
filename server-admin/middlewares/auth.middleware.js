@@ -30,6 +30,8 @@ export const validateJWT = async (req, res, next) => {
             role: role,
             companyId: companyMongoId, // Para compatibilidad multitenancy en Node.js
             branchId: branchMongoId,   // Para compatibilidad multitenancy en Node.js
+            name: email.split('@')[0],
+            surname: '',
             status: true
         };
         req.usuario = req.user; // Compatibilidad heredada
@@ -71,8 +73,8 @@ export const checkOwnership = (resourceType) => {
         // El SUPER_ADMIN tiene bypass total sobre cualquier recurso
         if (role === 'SUPER_ADMIN') return next();
 
-        const requestedCompanyId = req.body.companyId || req.params.companyId || req.query.companyId;
-        const requestedBranchId = req.body.branchId || req.params.branchId || req.query.branchId;
+        const requestedCompanyId = req.body?.companyId || req.params?.companyId || req.query?.companyId;
+        const requestedBranchId = req.body?.branchId || req.params?.branchId || req.query?.branchId;
 
         // Validación para COMPANY_ADMIN: Solo puede ver/editar lo que pertenece a su compañía
         if (role === 'COMPANY_ADMIN') {
