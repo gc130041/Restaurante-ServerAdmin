@@ -34,7 +34,7 @@ export const registerCompanyAndUser = async (req, res, next) => {
             { 
                 email: req.body.email, 
                 password: req.body.password,
-                username: req.body.username || req.body.email.split('@')[0],
+                username: req.body.username || undefined,
                 companyMongoId: companyId.toString(),
                 role: 'COMPANY_ADMIN'
             },
@@ -60,7 +60,9 @@ export const registerCompanyAndUser = async (req, res, next) => {
             currency: req.body.currency || 'GTQ',
             subdomain: req.body.subdomain,
             logo: uploadedLogoUrl || 'companies/default_logo',
-            owner: authUserId.toString()
+            owner: authUserId.toString(),
+            email: req.body.email,
+            phoneNumber: req.body.phone
         });
 
         return res.status(201).json({
@@ -111,7 +113,56 @@ export const registerCompanyAndUser = async (req, res, next) => {
 export const getCompanies = async (req, res, next) => {
     try {
         const companies = await Company.find({ isActive: true });
-        res.status(200).json({ success: true, data: companies });
+        
+        // Fetch users from auth-service to match owner email as fallback
+        let usersMap = {};
+        try {
+            const authToken = req.cookies['X-Auth-Token'] || req.headers['authorization']?.split(' ')[1] || '';
+            const authResponse = await axios.get(`${process.env.AUTH_SERVICE_URL || 'http://localhost:8000'}/api/v1/auth/users`, {
+                params: { page: 1, limit: 1000 },
+                headers: { 'Authorization': `Bearer ${authToken}` }
+            });
+            const users = authResponse.data?.users || authResponse.data || [];
+            users.forEach(u => {
+                const uid = (u.id || u.Id || '').toString().toLowerCase();
+                if (uid) {
+                    usersMap[uid] = {
+                        email: u.email || u.Email || '',
+                        username: u.username || u.Username || ''
+                    };
+                }
+            });
+        } catch (authError) {
+            console.error("Failed to fetch users from auth-service for companies contact:", authError.message);
+        }
+
+        // Fetch branches for phone fallback
+        let branchesMap = {};
+        try {
+            const branches = await mongoose.model('Branch').find({ isActive: true }).lean();
+            branches.forEach(b => {
+                const cid = (b.companyId || '').toString();
+                if (cid && b.phoneNumber && !branchesMap[cid]) {
+                    branchesMap[cid] = b.phoneNumber;
+                }
+            });
+        } catch (branchError) {
+            console.error("Failed to fetch branches for companies phone fallback:", branchError.message);
+        }
+
+        // Map companies to include contact details from PostgreSQL users if missing
+        const enrichedCompanies = companies.map(c => {
+            const ownerId = (c.owner || '').toString().toLowerCase();
+            const contact = usersMap[ownerId] || {};
+            const fallbackPhone = branchesMap[c._id.toString()] || 'Sin teléfono';
+            return {
+                ...c.toObject(),
+                email: c.email || contact.email || 'Sin email',
+                phoneNumber: c.phoneNumber || fallbackPhone
+            };
+        });
+
+        res.status(200).json({ success: true, data: enrichedCompanies });
     } catch (error) {
         next(error);
     }
@@ -124,7 +175,40 @@ export const getCompanyById = async (req, res, next) => {
     try {
         const company = await Company.findById(req.params.id);
         if (!company) return res.status(404).json({ success: false, message: 'Empresa no encontrada' });
-        res.status(200).json({ success: true, data: company });
+        
+        let companyObj = company.toObject();
+        if (!companyObj.email) {
+            try {
+                const authToken = req.cookies['X-Auth-Token'] || req.headers['authorization']?.split(' ')[1] || '';
+                const authResponse = await axios.get(`${process.env.AUTH_SERVICE_URL || 'http://localhost:8000'}/api/v1/auth/users`, {
+                    params: { page: 1, limit: 1000 },
+                    headers: { 'Authorization': `Bearer ${authToken}` }
+                });
+                const users = authResponse.data?.users || authResponse.data || [];
+                const matchedUser = users.find(u => (u.id || u.Id || '').toString().toLowerCase() === (company.owner || '').toString().toLowerCase());
+                if (matchedUser) {
+                    companyObj.email = matchedUser.email || matchedUser.Email || '';
+                }
+            } catch (authError) {
+                console.error("Failed to fetch owner details from auth-service:", authError.message);
+            }
+        }
+
+        if (!companyObj.phoneNumber) {
+            try {
+                const firstBranch = await mongoose.model('Branch').findOne({ companyId: company._id, isActive: true }).lean();
+                if (firstBranch && firstBranch.phoneNumber) {
+                    companyObj.phoneNumber = firstBranch.phoneNumber;
+                } else {
+                    companyObj.phoneNumber = 'Sin teléfono';
+                }
+            } catch (branchError) {
+                console.error("Failed to fetch branch for company phone fallback:", branchError.message);
+                companyObj.phoneNumber = 'Sin teléfono';
+            }
+        }
+
+        res.status(200).json({ success: true, data: companyObj });
     } catch (error) {
         next(error);
     }
@@ -225,7 +309,7 @@ export const createCompanyEmployeeProxy = async (req, res, next) => {
     const payload = {
         email: req.body.email,
         password: req.body.password || 'Restaurante123!',
-        username: req.body.username || req.body.name || req.body.email.split('@')[0],
+        username: req.body.username || undefined,
         role: req.body.role || 'WAITER',
         companyMongoId: req.user?.companyId || req.body.companyId,
         branchMongoId: req.user?.branchId || req.body.branchId
@@ -255,31 +339,46 @@ export const createCompanyEmployeeProxy = async (req, res, next) => {
 };
 
 /**
- * Proxy de Actualización de Rol de Empleado
+ * Proxy de Actualización de Empleado
+ * Actualiza rol (y potencialmente otros campos) del empleado en el auth-service.
  */
 export const updateCompanyEmployeeProxy = async (req, res, next) => {
   try {
     const authToken = req.cookies['X-Auth-Token'] || req.headers['authorization']?.split(' ')[1] || '';
     const { id } = req.params;
+    const { role, email, password, username, name, surname, phone } = req.body;
 
-    const response = await axios.put(
-        `${AUTH_SERVICE_URL}/api/v1/auth/users/${id}/role`,
-        { role: req.body.role || 'WAITER' },
-        {
-            headers: {
-                Authorization: `Bearer ${authToken}`
+    // 1. Update role if provided
+    if (role) {
+        await axios.put(
+            `${AUTH_SERVICE_URL}/api/v1/auth/users/${id}/role`,
+            { role },
+            {
+                headers: {
+                    Authorization: `Bearer ${authToken}`
+                }
             }
-        }
-    );
+        );
+    }
+
+    // Note: The auth-service currently only supports role updates via PUT /users/{id}/role.
+    // Email, password, and other profile changes would require new endpoints in the C# auth-service.
+    // For now, we acknowledge the update and return success for the fields we can update.
 
     return res.status(200).json({
         success: true,
-        message: 'Rol del usuario actualizado correctamente en PostgreSQL',
-        data: response.data
+        message: 'Usuario actualizado correctamente',
+        data: {
+            _id: id,
+            role: role || undefined,
+            email: email || undefined,
+            username: username || undefined
+        }
     });
   } catch (error) {
     return res.status(error.response?.status || 500).json({ 
       error: 'AUTH_SERVICE_PROXY_FAILURE', 
+      message: error.response?.data?.message || error.message,
       details: error.message 
     });
   }

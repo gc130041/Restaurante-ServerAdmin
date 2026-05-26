@@ -19,6 +19,9 @@ const companySchema = new mongoose.Schema({
     logo:          { type: String, default: 'companies/default_logo' },       // Cloudinary path
     subdomain:     { type: String, required: true, trim: true, unique: true, lowercase: true,
                      match: [/^[a-z0-9-]+$/, 'Subdominio solo permite letras minúsculas, números y guiones'] },
+    // === Contacto ===
+    email:         { type: String, trim: true },
+    phoneNumber:   { type: String, trim: true },
     // === Propietario (COMPANY_ADMIN) ===
     owner:         { type: String, required: true },
     // === Estado ===

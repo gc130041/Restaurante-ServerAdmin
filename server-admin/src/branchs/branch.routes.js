@@ -54,8 +54,8 @@ router.post('/',
 router.put('/:id', 
     ...auth, 
     authorizeRole('SUPER_ADMIN', 'COMPANY_ADMIN'), 
-    verifyResourceOwnership(Branch), 
     uploadBranchImage.single('photos'), 
+    verifyResourceOwnership(Branch), 
     validateUpdateBranch, 
     updateBranch
 );

@@ -62,7 +62,7 @@ export const createBranch = async (req, res, next) => {
     try {
         const branchData = { 
             ...req.body, 
-            companyId: req.companyId // Inyectar ID de la empresa desde el token/contexto
+            companyId: req.companyId || req.body.companyId // Inyectar ID si existe en contexto, sino del body
         };
 
         if (req.file) {

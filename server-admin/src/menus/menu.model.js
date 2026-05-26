@@ -14,6 +14,7 @@ const MenuSchema = new mongoose.Schema({
   branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
   name: { type: String, required: true, trim: true },
   description: { type: String, trim: true, maxLength: [500, 'La descripción no puede exceder los 500 caracteres'] },
+  itemType: { type: String, required: true, enum: ['SINGLE', 'COMBO'], default: 'SINGLE', index: true },
   sku: { type: String, required: true, unique: true },
   price: { type: Number, required: true, min: 0 },
   category: {
@@ -59,8 +60,8 @@ MenuSchema.virtual('effectivePrice').get(function() {
 });
 
 // Middleware protector de desbordamiento de pila (DFS anti-ciclos)  
-MenuSchema.pre('save', async function(next) {  
-  if (!this.isModified('recipe') || this.recipe.length === 0) return next();  
+MenuSchema.pre('save', async function() {  
+  if (!this.isModified('recipe') || this.recipe.length === 0) return;  
   const currentMenuId = this._id.toString();  
   const visited = new Set();
 
@@ -75,12 +76,9 @@ MenuSchema.pre('save', async function(next) {
     }  
   }
 
-  try {  
-    for (const component of this.recipe) {  
-      if (component.componentType === 'Menu') await checkCycles(component.componentId.toString());  
-    }  
-    next();  
-  } catch (error) { next(error); }  
+  for (const component of this.recipe) {  
+    if (component.componentType === 'Menu') await checkCycles(component.componentId.toString());  
+  }  
 });
 
 export const Menu = mongoose.model('Menu', MenuSchema);

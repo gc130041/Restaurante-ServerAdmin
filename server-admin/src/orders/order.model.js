@@ -63,13 +63,12 @@ const OrderSchema = new Schema(
     }
 );
 
-OrderSchema.pre("save", function (next) {
+OrderSchema.pre("save", function () {
     if (this.items && this.items.length > 0) {
         this.total = this.items.reduce((acc, item) => acc + (item.priceAtTime * item.quantity), 0);
     } else {
         this.total = 0;
     }
-    next();
 });
 
 export default model("Order", OrderSchema);

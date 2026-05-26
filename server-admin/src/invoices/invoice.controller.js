@@ -4,6 +4,22 @@ import CreditNote from "./creditNote.model.js";
 import Order from "../orders/order.model.js";
 import Table from "../tables/table.model.js";
 
+const checkReplicaSet = async () => {
+    try {
+        const client = mongoose.connection.client;
+        if (client && client.topology && client.topology.description) {
+            const type = client.topology.description.type;
+            if (type === 'ReplicaSetNoPrimary' || type === 'ReplicaSetWithPrimary' || type === 'Sharded') {
+                return true;
+            }
+        }
+        const hello = await mongoose.connection.db.admin().command({ hello: 1 });
+        return !!(hello.setName || hello.hosts);
+    } catch (e) {
+        return false;
+    }
+};
+
 /**
  * Crea una factura en estado DRAFT a partir de una orden activa.
  * Captura un snapshot de los ítems de la orden para evitar inconsistencias futuras.
@@ -57,13 +73,28 @@ export const createDraftFromOrder = async (req, res, next) => {
  * Pasa a ser legalmente inmutable y marca la orden original como pagada.
  */
 export const commitInvoice = async (req, res, next) => {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    let session = null;
+    try {
+        const hasReplicaSet = await checkReplicaSet();
+        if (hasReplicaSet) {
+            session = await mongoose.startSession();
+            session.startTransaction();
+        } else {
+            console.warn("MongoDB replica set not detected. Running commitInvoice without transaction session.");
+        }
+    } catch (sessionError) {
+        console.warn("MongoDB replica set check failed or session failed. Running without transaction.");
+        session = null;
+    }
+
     try {
         const { id } = req.params;
         const { paymentMethod } = req.body;
 
-        const invoice = await Invoice.findById(id).session(session);
+        const invoice = session 
+            ? await Invoice.findById(id).session(session)
+            : await Invoice.findById(id);
+
         if (!invoice) throw new Error("Factura no encontrada");
         if (invoice.status !== 'DRAFT') throw new Error(`Operación inválida: La factura está en estado ${invoice.status}`);
 
@@ -72,29 +103,50 @@ export const commitInvoice = async (req, res, next) => {
         invoice.committedAt = new Date();
         if (paymentMethod) invoice.paymentMethod = paymentMethod;
 
-        await invoice.save({ session });
+        if (session) {
+            await invoice.save({ session });
+        } else {
+            await invoice.save();
+        }
 
         // Cerrar la orden y liberar sus mesas
-        const order = await Order.findById(invoice.orderId).session(session);
+        const order = session
+            ? await Order.findById(invoice.orderId).session(session)
+            : await Order.findById(invoice.orderId);
+
         if (order) {
             order.status = "paid";
             order.items.forEach(i => { if (i.status !== 'cancelled') i.status = 'paid'; });
-            await order.save({ session });
-
-            await Table.updateMany(
-                { _id: { $in: order.tables } }, 
-                { $set: { status: "Disponible" } }, 
-                { session }
-            );
+            
+            if (session) {
+                await order.save({ session });
+                await Table.updateMany(
+                    { _id: { $in: order.tables } }, 
+                    { $set: { status: "Disponible" } }, 
+                    { session }
+                );
+            } else {
+                await order.save();
+                await Table.updateMany(
+                    { _id: { $in: order.tables } }, 
+                    { $set: { status: "Disponible" } }
+                );
+            }
         }
 
-        await session.commitTransaction();
+        if (session) {
+            await session.commitTransaction();
+        }
         res.status(200).json({ success: true, message: "Factura emitida (COMMITTED) exitosamente.", data: invoice });
     } catch (error) {
-        await session.abortTransaction();
+        if (session) {
+            await session.abortTransaction();
+        }
         next(error);
     } finally {
-        session.endSession();
+        if (session) {
+            session.endSession();
+        }
     }
 };
 
@@ -103,8 +155,20 @@ export const commitInvoice = async (req, res, next) => {
  * Genera automáticamente una Nota de Crédito para mantener la trazabilidad contable.
  */
 export const voidInvoice = async (req, res, next) => {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    let session = null;
+    try {
+        const hasReplicaSet = await checkReplicaSet();
+        if (hasReplicaSet) {
+            session = await mongoose.startSession();
+            session.startTransaction();
+        } else {
+            console.warn("MongoDB replica set not detected. Running voidInvoice without transaction session.");
+        }
+    } catch (sessionError) {
+        console.warn("MongoDB replica set check failed or session failed. Running without transaction.");
+        session = null;
+    }
+
     try {
         const { id } = req.params;
         const { reason } = req.body;
@@ -112,7 +176,10 @@ export const voidInvoice = async (req, res, next) => {
 
         if (!reason) throw new Error("Se requiere justificar el motivo de la anulación (reason).");
 
-        const invoice = await Invoice.findById(id).session(session);
+        const invoice = session
+            ? await Invoice.findById(id).session(session)
+            : await Invoice.findById(id);
+
         if (!invoice) throw new Error("Factura no encontrada");
         if (invoice.status !== 'COMMITTED') throw new Error(`Solo se pueden anular facturas emitidas. Estado actual: ${invoice.status}`);
 
@@ -127,31 +194,54 @@ export const voidInvoice = async (req, res, next) => {
             amount: invoice.totalAmount,
             status: 'COMMITTED'
         });
-        await creditNote.save({ session });
+
+        if (session) {
+            await creditNote.save({ session });
+        } else {
+            await creditNote.save();
+        }
 
         // 2. Marcar la factura original como anulada.
-        // Se utiliza la colección nativa para bypassear el Mongoose Pre-Hook de inmutabilidad
-        // ya que la anulación es el único flujo legal que modifica una factura COMMITTED.
-        await Invoice.collection.updateOne(
-            { _id: invoice._id },
-            { 
-                $set: { 
-                    status: 'VOIDED', 
-                    voidedAt: new Date(), 
-                    voidReason: reason 
+        if (session) {
+            await Invoice.collection.updateOne(
+                { _id: invoice._id },
+                { 
+                    $set: { 
+                        status: 'VOIDED', 
+                        voidedAt: new Date(), 
+                        voidReason: reason 
+                    },
+                    $push: { creditNotes: creditNote._id }
                 },
-                $push: { creditNotes: creditNote._id }
-            },
-            { session }
-        );
+                { session }
+            );
+        } else {
+            await Invoice.collection.updateOne(
+                { _id: invoice._id },
+                { 
+                    $set: { 
+                        status: 'VOIDED', 
+                        voidedAt: new Date(), 
+                        voidReason: reason 
+                    },
+                    $push: { creditNotes: creditNote._id }
+                }
+            );
+        }
 
-        await session.commitTransaction();
+        if (session) {
+            await session.commitTransaction();
+        }
         res.status(200).json({ success: true, message: "Factura anulada. Se generó la respectiva Nota de Crédito.", data: creditNote });
     } catch (error) {
-        await session.abortTransaction();
+        if (session) {
+            await session.abortTransaction();
+        }
         next(error);
     } finally {
-        session.endSession();
+        if (session) {
+            session.endSession();
+        }
     }
 };
 

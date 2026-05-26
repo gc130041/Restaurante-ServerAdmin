@@ -2,6 +2,23 @@ import mongoose from 'mongoose';
 import Stock from './stock.model.js';
 import Menu from '../menus/menu.model.js';
 
+const checkReplicaSet = async () => {
+    try {
+        const client = mongoose.connection.client;
+        if (client && client.topology && client.topology.description) {
+            const type = client.topology.description.type;
+            if (type === 'ReplicaSetNoPrimary' || type === 'ReplicaSetWithPrimary' || type === 'Sharded') {
+                return true;
+            }
+        }
+        const hello = await mongoose.connection.db.admin().command({ hello: 1 });
+        return !!(hello.setName || hello.hosts);
+    } catch (e) {
+        return false;
+    }
+};
+
+
 /**
  * Desempaqueta combos en sus ítems individuales (SINGLE) recursivamente.
  * Un COMBO se reemplaza por sus sub-ítems con las cantidades multiplicadas.
@@ -68,8 +85,19 @@ const flattenOrderItems = async (items, session = null, visited = new Set()) => 
  * @param {string} mode - 'DEDUCT' para restar, 'RESTORE' para sumar.
  */
 const processStockUpdate = async (branchId, items, mode = 'DEDUCT') => {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    let session = null;
+    try {
+        const hasReplicaSet = await checkReplicaSet();
+        if (hasReplicaSet) {
+            session = await mongoose.startSession();
+            session.startTransaction();
+        } else {
+            console.warn("MongoDB replica set not detected. Running processStockUpdate without transaction session.");
+        }
+    } catch (sessionError) {
+        console.warn("MongoDB replica set check failed or session failed. Running without transaction.");
+        session = null;
+    }
     try {
         const isDeduct = mode === 'DEDUCT';
         
@@ -78,10 +106,12 @@ const processStockUpdate = async (branchId, items, mode = 'DEDUCT') => {
 
         // 1. Obtener recetas de todos los platillos SINGLE resultantes
         const menuItemIds = flatItems.map(i => i.menuItem);
-        const menus = await Menu.find({ _id: { $in: menuItemIds } })
+        const menusQuery = Menu.find({ _id: { $in: menuItemIds } })
             .select('name recipe')
-            .populate('recipe.ingredientId', 'name unit')
-            .session(session);
+            .populate('recipe.ingredientId', 'name unit');
+            
+        if (session) menusQuery.session(session);
+        const menus = await menusQuery;
 
         // 2. Calcular demanda consolidada por ingrediente
         const demand = new Map();
@@ -104,7 +134,9 @@ const processStockUpdate = async (branchId, items, mode = 'DEDUCT') => {
         // 3. Validar y actualizar stock
         const insufficientItems = [];
         for (const [ingredientId, { totalAmount, name }] of demand) {
-            const stock = await Stock.findOne({ branchId, ingredientId }).session(session);
+            const stockQuery = Stock.findOne({ branchId, ingredientId });
+            if (session) stockQuery.session(session);
+            const stock = await stockQuery;
 
             if (isDeduct) {
                 if (!stock || stock.quantity < totalAmount) {
@@ -123,7 +155,11 @@ const processStockUpdate = async (branchId, items, mode = 'DEDUCT') => {
             }
 
             if (stock) {
-                await stock.save({ session });
+                if (session) {
+                    await stock.save({ session });
+                } else {
+                    await stock.save();
+                }
                 // Alerta de stock bajo
                 if (isDeduct && stock.quantity <= stock.minStock) {
                     console.warn(`[Inventory Alert] Stock bajo: ${name} en sucursal ${branchId}. Quedan: ${stock.quantity}`);
@@ -132,17 +168,21 @@ const processStockUpdate = async (branchId, items, mode = 'DEDUCT') => {
         }
 
         if (insufficientItems.length > 0) {
-            await session.abortTransaction();
+            if (session) await session.abortTransaction();
             const detail = insufficientItems.map(i => `${i.ingredient}: necesitas ${i.needed}, hay ${i.available}`).join('; ');
             throw new Error(`Stock insuficiente: ${detail}`);
         }
 
-        await session.commitTransaction();
+        if (session) {
+            await session.commitTransaction();
+        }
     } catch (error) {
-        if (session.inTransaction()) await session.abortTransaction();
+        if (session && session.inTransaction()) await session.abortTransaction();
         throw error;
     } finally {
-        session.endSession();
+        if (session) {
+            session.endSession();
+        }
     }
 };
 

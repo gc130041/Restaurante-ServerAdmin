@@ -50,10 +50,30 @@ export const getMenuById = async (req, res, next) => {
  */
 export const createMenu = async (req, res, next) => {
     try {
+        let companyId = req.companyId;
+
+        // If companyId is not in token (e.g. SUPER_ADMIN), fetch it from the branch
+        if (!companyId && req.body.branch) {
+            const branchObj = await mongoose.model('Branch').findById(req.body.branch).lean();
+            if (branchObj) {
+                companyId = branchObj.companyId;
+            }
+        }
+
         const menuData = { 
             ...req.body, 
-            companyId: req.companyId 
+            companyId: companyId,
+            branchId: req.body.branch
         };
+
+        // If SKU is missing, generate a unique one
+        if (!menuData.sku) {
+            const catPrefix = (req.body.category || 'GEN').substring(0, 3).toUpperCase().replace(/[^A-Z0-9]/g, '');
+            const namePrefix = (req.body.name || 'ITEM').substring(0, 3).toUpperCase().replace(/[^A-Z0-9]/g, '');
+            const timestamp = Date.now().toString().slice(-4);
+            const random = Math.floor(100 + Math.random() * 900);
+            menuData.sku = `${catPrefix}-${namePrefix}-${timestamp}${random}`;
+        }
 
         if (req.file) {
             menuData.image = req.file.path; // Cloudinary URL
@@ -76,6 +96,10 @@ export const updateMenu = async (req, res, next) => {
     try {
         const { id } = req.params;
         const updateData = { ...req.body };
+
+        if (req.body.branch) {
+            updateData.branchId = req.body.branch;
+        }
 
         if (req.file) {
             updateData.image = req.file.path;

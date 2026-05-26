@@ -23,7 +23,10 @@ export const getActiveOrdersByBranch = async (req, res, next) => {
         const orders = await Order.find({
             branch: branchId,
             status: { $nin: ["paid", "cancelled"] }
-        }).populate('tables').populate('waiter', 'name surname');
+        })
+        .populate('tables')
+        .populate('items.menuItem', 'name price')
+        .populate('waiter', 'name surname');
         res.status(200).json({ success: true, data: orders });
     } catch (error) {
         next(error);
@@ -34,8 +37,9 @@ export const getActiveOrdersByBranch = async (req, res, next) => {
  * Crea una nueva orden y ocupa las mesas correspondientes.
  */
 export const createOrder = async (req, res) => {
+    let tablesUpdated = false;
+    const { tables, branch, items } = req.body;
     try {
-        const { tables, branch, items } = req.body;
         const waiter = req.user._id;
 
         // Validar disponibilidad de mesas
@@ -47,6 +51,7 @@ export const createOrder = async (req, res) => {
         if (tableUpdates.modifiedCount !== tables.length) {
             throw new Error("Una o más mesas seleccionadas no están disponibles.");
         }
+        tablesUpdated = true;
 
         // Snapshot de precios actuales para la orden
         for (const item of items) {
@@ -59,26 +64,54 @@ export const createOrder = async (req, res) => {
         const newOrder = new Order({ tables, waiter, branch, items });
         await newOrder.save();
 
+        // Resolve companyId dynamically (e.g. for SUPER_ADMIN)
+        let companyId = req.companyId || req.body.companyId || req.user?.companyId;
+        if (!companyId && branch) {
+            const branchObj = await mongoose.model('Branch').findById(branch).lean();
+            if (branchObj) {
+                companyId = branchObj.companyId;
+            }
+        }
+
+        // Obtener nombres/números de mesa para auditoría
+        const tableObjs = await Table.find({ _id: { $in: tables } }).lean();
+        const tableNumbers = tableObjs.map(t => t.number || t._id).join(', ');
+
+        const actorName = `${req.user.name || ''} ${req.user.surname || ''}`.trim() || req.user.email.split('@')[0];
+
         // Registro de auditoría
         await OrderAudit.create([{
             orderId:   newOrder._id,
             actorId:   req.user._id,
             actorRole: req.user.role,
-            actorName: `${req.user.name} ${req.user.surname}`,
+            actorName: actorName,
             action:    'ORDER_CREATED',
             details: {
-                description: `Orden creada con ${items.length} ítems en mesa(s) ${tables.join(', ')}`
+                description: `Orden creada con ${items.length} ítems en mesa(s) ${tableNumbers}`
             },
             branchId:  branch,
-            companyId: req.companyId || req.body.companyId || req.user?.companyId,
+            companyId: companyId,
             ipAddress: req.ip
         }]);
 
         res.status(201).json({ success: true, order: newOrder });
     } catch (error) {
+        console.error("CREATE ORDER ERROR STACK:", error);
+        // Rollback tables status if they were updated
+        if (tablesUpdated) {
+            try {
+                await Table.updateMany(
+                    { _id: { $in: tables } },
+                    { $set: { status: "Disponible" } }
+                );
+            } catch (rollbackError) {
+                console.error("Failed to rollback tables status:", rollbackError);
+            }
+        }
         res.status(400).json({ success: false, message: error.message });
     }
 };
+
 
 /**
  * Actualiza el estado de un ítem individual dentro de una orden.
@@ -118,18 +151,24 @@ export const updateItemStatus = async (req, res) => {
 
         item.status = nextStatus;
 
+        // Obtener nombre del platillo para auditoría
+        const menuItemObj = await Menu.findById(item.menuItem).lean();
+        const menuItemName = menuItemObj ? menuItemObj.name : 'Platillo';
+
+        const actorName = `${req.user.name || ''} ${req.user.surname || ''}`.trim() || req.user.email.split('@')[0];
+
         // Registro de auditoría
         await OrderAudit.create({
             orderId:   order._id,
             actorId:   req.user._id,
             actorRole: req.user.role,
-            actorName: `${req.user.name} ${req.user.surname}`,
+            actorName: actorName,
             action:    'ITEM_STATUS_CHANGED',
             details: {
                 menuItemId:     item.menuItem,
                 previousStatus: previousStatus,
                 newStatus:      nextStatus,
-                description:    `Ítem cambió de "${previousStatus}" a "${nextStatus}"`
+                description:    `Platillo "${menuItemName}" cambió de "${previousStatus}" a "${nextStatus}"`
             },
             branchId:  order.branch,
             companyId: req.companyId || req.user?.companyId,
@@ -184,12 +223,14 @@ export const updateOrderStatus = async (req, res) => {
 
         order.status = nextStatus;
 
+        const actorName = `${req.user.name || ''} ${req.user.surname || ''}`.trim() || req.user.email.split('@')[0];
+
         // Registro de auditoría
         await OrderAudit.create({
             orderId:   order._id,
             actorId:   req.user._id,
             actorRole: req.user.role,
-            actorName: `${req.user.name} ${req.user.surname}`,
+            actorName: actorName,
             action:    nextStatus === 'cancelled' ? 'ORDER_CANCELLED' : 'ORDER_STATUS_CHANGED',
             details: {
                 previousStatus: previousStatus,
